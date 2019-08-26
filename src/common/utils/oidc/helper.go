@@ -24,11 +24,13 @@ import (
 	"github.com/goharbor/harbor/src/common/utils/log"
 	"github.com/goharbor/harbor/src/core/config"
 	"golang.org/x/oauth2"
+	"math/rand"
 	"net/http"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+
 )
 
 const googleEndpoint = "https://accounts.google.com"
@@ -132,6 +134,16 @@ func getOauthConf() (*oauth2.Config, error) {
 	}, nil
 }
 
+var letters = []rune("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")
+
+func randSeq(n int) string {
+	b := make([]rune, n)
+	for i := range b {
+		b[i] = letters[rand.Intn(len(letters))]
+	}
+	return string(b)
+}
+
 // AuthCodeURL returns the URL for OIDC provider's consent page.  The state should be verified when user is redirected
 // back to Harbor.
 func AuthCodeURL(state string) (string, error) {
@@ -143,11 +155,18 @@ func AuthCodeURL(state string) (string, error) {
 	if strings.HasPrefix(conf.Endpoint.AuthURL, googleEndpoint) { // make sure the refresh token will be returned
 		return conf.AuthCodeURL(state, oauth2.AccessTypeOffline, oauth2.SetAuthURLParam("prompt", "consent")), nil
 	}
-	return conf.AuthCodeURL(state), nil
+	rand.Seed(time.Now().UnixNano())
+
+	return conf.AuthCodeURL(state,
+		oauth2.SetAuthURLParam("response_mode", "form_post"),
+		oauth2.SetAuthURLParam("response_type", "code id_token"),
+		oauth2.SetAuthURLParam("nonce", randSeq(10))), nil
 }
 
 // ExchangeToken get the token from token provider via the code
 func ExchangeToken(ctx context.Context, code string) (*Token, error) {
+	oauth2.RegisterBrokenAuthHeaderProvider("https://sts-test.adidas-group.com")
+
 	oauth, err := getOauthConf()
 	if err != nil {
 		log.Errorf("Failed to get OAuth configuration, error: %v", err)
@@ -155,6 +174,7 @@ func ExchangeToken(ctx context.Context, code string) (*Token, error) {
 	}
 	setting := provider.setting.Load().(models.OIDCSetting)
 	ctx = clientCtx(ctx, setting.VerifyCert)
+
 	oauthToken, err := oauth.Exchange(ctx, code)
 	if err != nil {
 		return nil, err

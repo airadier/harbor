@@ -41,6 +41,7 @@ func initRouters() {
 		beego.Router(common.OIDCLoginPath, &controllers.OIDCController{}, "get:RedirectLogin")
 		beego.Router("/c/oidc/onboard", &controllers.OIDCController{}, "post:Onboard")
 		beego.Router(common.OIDCCallbackPath, &controllers.OIDCController{}, "get:Callback")
+		beego.Router(common.OIDCCallbackPath, &controllers.OIDCController{}, "post:CallbackPost")
 
 		// API:
 		beego.Router("/api/projects/:pid([0-9]+)/members/?:pmid([0-9]+)", &api.ProjectMemberAPI{})

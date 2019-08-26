@@ -15,8 +15,10 @@
 package controllers
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
+
 	"github.com/goharbor/harbor/src/common"
 	"github.com/goharbor/harbor/src/common/dao"
 	"github.com/goharbor/harbor/src/common/models"
@@ -59,6 +61,18 @@ func (oc *OIDCController) Prepare() {
 	}
 }
 
+func parseJWT(p string) ([]byte, error) {
+	parts := strings.Split(p, ".")
+	if len(parts) < 2 {
+		return nil, fmt.Errorf("oidc: malformed jwt, expected 3 parts got %d", len(parts))
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return nil, fmt.Errorf("oidc: malformed jwt payload: %v", err)
+	}
+	return payload, nil
+}
+
 // RedirectLogin redirect user's browser to OIDC provider's login page
 func (oc *OIDCController) RedirectLogin() {
 	state := utils.GenerateRandomString()
@@ -67,6 +81,11 @@ func (oc *OIDCController) RedirectLogin() {
 		oc.SendInternalServerError(err)
 		return
 	}
+
+	//Begin: Adidas
+	log.Infof("**Adidas** OIDC URL is %s", url)
+	//End: Adidas
+
 	oc.SetSession(stateKey, state)
 	log.Debugf("State dumped to session: %s", state)
 	// Force to use the func 'Redirect' of beego.Controller
@@ -101,6 +120,15 @@ func (oc *OIDCController) Callback() {
 		return
 	}
 	log.Debugf("ID token from provider: %s", token.IDToken)
+
+	//Begin: Adidas
+	payload, err := parseJWT(token.IDToken)
+	if err != nil {
+		oc.SendInternalServerError(err)
+		return
+	}
+	log.Infof("**Adidas** Claims: %s", string(payload))
+	//End: Adidas
 
 	idToken, err := oidc.VerifyToken(ctx, token.IDToken)
 	if err != nil {
@@ -151,6 +179,98 @@ func (oc *OIDCController) Callback() {
 		oc.Controller.Redirect("/", http.StatusFound)
 	}
 }
+
+//Begin: Adidas
+
+// CallbackPost handles redirection from OIDC provider.  It will exchange the token and
+// kick off onboard if needed.
+func (oc *OIDCController) CallbackPost() {
+	if oc.GetString("state") != oc.GetSession(stateKey) {
+		log.Errorf("State mismatch, in session: %s, in url: %s", oc.GetSession(stateKey),
+			oc.Ctx.Request.URL.Query().Get("state"))
+		oc.SendBadRequestError(errors.New("State mismatch"))
+		return
+	}
+
+	error := oc.GetString("error")
+	if error != "" {
+		errorDescription := oc.GetString("error_description")
+		log.Errorf("OIDC callback returned error: %s - %s", error, errorDescription)
+		oc.SendBadRequestError(errors.Errorf("OIDC callback returned error: %s - %s", error, errorDescription))
+		return
+	}
+
+	code := oc.GetString("code")
+	ctx := oc.Ctx.Request.Context()
+	token, err := oidc.ExchangeToken(ctx, code)
+	if err != nil {
+		log.Errorf("Failed to exchange token, error: %v", err)
+		// Return a 4xx error so user can see the details in case it's due to misconfiguration.
+		oc.SendBadRequestError(err)
+		return
+	}
+	log.Debugf("ID token from provider: %s", token.IDToken)
+
+	//Begin: Adidas
+	payload, err := parseJWT(token.IDToken)
+	if err != nil {
+		oc.SendInternalServerError(err)
+		return
+	}
+	log.Infof("**Adidas** Claims: %s", string(payload))
+	//End: Adidas
+
+	idToken, err := oidc.VerifyToken(ctx, token.IDToken)
+	if err != nil {
+		oc.SendInternalServerError(err)
+		return
+	}
+	d := &oidcUserData{}
+	err = idToken.Claims(d)
+	if err != nil {
+		oc.SendInternalServerError(err)
+		return
+	}
+	ouDataStr, err := json.Marshal(d)
+	if err != nil {
+		oc.SendInternalServerError(err)
+		return
+	}
+	u, err := dao.GetUserBySubIss(d.Subject, d.Issuer)
+	if err != nil {
+		oc.SendInternalServerError(err)
+		return
+	}
+
+	tokenBytes, err := json.Marshal(token)
+	if err != nil {
+		oc.SendInternalServerError(err)
+		return
+	}
+	oc.SetSession(tokenKey, tokenBytes)
+
+	if u == nil {
+		oc.SetSession(userInfoKey, string(ouDataStr))
+		oc.Controller.Redirect(fmt.Sprintf("/oidc-onboard?username=%s", strings.Replace(d.Username, " ", "_", -1)),
+			http.StatusFound)
+	} else {
+		oidcUser, err := dao.GetOIDCUserByUserID(u.UserID)
+		if err != nil {
+			oc.SendInternalServerError(err)
+			return
+		}
+		_, t, err := secretAndToken(tokenBytes)
+		oidcUser.Token = t
+		if err := dao.UpdateOIDCUser(oidcUser); err != nil {
+			oc.SendInternalServerError(err)
+			return
+		}
+		oc.SetSession(userKey, *u)
+		oc.Controller.Redirect("/", http.StatusFound)
+	}
+}
+
+//End: Adidas
 
 // Onboard handles the request to onboard an user authenticated via OIDC provider
 func (oc *OIDCController) Onboard() {
