@@ -160,6 +160,7 @@ func AuthCodeURL(state string) (string, error) {
 	return conf.AuthCodeURL(state,
 		oauth2.SetAuthURLParam("response_mode", "form_post"),
 		oauth2.SetAuthURLParam("response_type", "code id_token"),
+		oauth2.SetAuthURLParam("resource", "RESOURCE_ID"),
 		oauth2.SetAuthURLParam("nonce", randSeq(10))), nil
 }
 
