@@ -132,25 +132,113 @@ func (oc *OIDCController) Callback() {
 	}
 	oc.SetSession(tokenKey, tokenBytes)
 
-	if u == nil {
-		oc.SetSession(userInfoKey, string(ouDataStr))
-		oc.Controller.Redirect(fmt.Sprintf("/oidc-onboard?username=%s", strings.Replace(d.Username, " ", "_", -1)),
-			http.StatusFound)
-	} else {
-		oidcUser, err := dao.GetOIDCUserByUserID(u.UserID)
-		if err != nil {
-			oc.SendInternalServerError(err)
-			return
-		}
-		_, t, err := secretAndToken(tokenBytes)
-		oidcUser.Token = t
-		if err := dao.UpdateOIDCUser(oidcUser); err != nil {
-			oc.SendInternalServerError(err)
-			return
-		}
-		oc.PopulateUserSession(*u)
-		oc.Controller.Redirect("/", http.StatusFound)
+	oidcSettings, err := config.OIDCSetting()
+	if err != nil {
+		oc.SendInternalServerError(err)
+		return
 	}
+
+	if u == nil {
+		// Recover the username from d.Username by default
+		username := d.Username
+
+		// Check if there is a custom username claim setting
+		if oidcSettings.UserClaim != "" {
+			// Generic unmarshall to retrieve the custom claim
+			allClaims := make(map[string]interface{})
+			err = idToken.Claims(&allClaims)
+			if err != nil {
+				oc.SendInternalServerError(err)
+				return
+			}
+
+			username = allClaims[oidcSettings.UserClaim].(string)
+		}
+
+		// Fix blanks in username
+		username = strings.Replace(username, " ", "_", -1)
+
+		// If automatic onboard is enabled, skip the onboard page
+		if oidcSettings.AutoOnboard {
+			log.Error("**AIM** automatic onboarding\n")
+			user, onboarded := userOnboard(oc, d, username, tokenBytes)
+			if onboarded == false {
+				log.Error("**AIM** Not onboarded\n")
+				return
+			}
+			log.Error("**AIM** Onboarded\n")
+			u = user
+
+		} else {
+			log.Error("**AIM** User is null\n")
+			oc.SetSession(userInfoKey, string(ouDataStr))
+			oc.Controller.Redirect(fmt.Sprintf("/oidc-onboard?username=%s", username), http.StatusFound)
+			// Once redirected, no further actions are done
+			return
+		}
+
+	}
+
+	log.Errorf("**AIM** User is %+v\n", u)
+
+	//TODO: Update user details (email, etc.) from OIDC token?
+	oidcUser, err := dao.GetOIDCUserByUserID(u.UserID)
+	if err != nil {
+		oc.SendInternalServerError(err)
+		return
+	}
+	_, t, err := secretAndToken(tokenBytes)
+	oidcUser.Token = t
+	if err := dao.UpdateOIDCUser(oidcUser); err != nil {
+		oc.SendInternalServerError(err)
+		return
+	}
+	oc.PopulateUserSession(*u)
+	oc.Controller.Redirect("/", http.StatusFound)
+
+}
+
+func userOnboard(oc *OIDCController, d *oidcUserData, username string, tokenBytes []byte) (*models.User, bool) {
+
+	s, t, err := secretAndToken(tokenBytes)
+	if err != nil {
+		log.Error("**AIM** Error with secret and token\n")
+		oc.SendInternalServerError(err)
+		return nil, false
+	}
+
+	oidcUser := models.OIDCUser{
+		SubIss: d.Subject + d.Issuer,
+		Secret: s,
+		Token:  t,
+	}
+
+	log.Errorf("**AIM** OIDC user created: %v\n", oidcUser)
+
+	email := d.Email
+	user := models.User{
+		Username:     username,
+		Realname:     username,
+		Email:        email,
+		OIDCUserMeta: &oidcUser,
+		Comment:      oidcUserComment,
+	}
+
+	log.Errorf("**AIM** User created: %+v\n", user)
+
+	err = dao.OnBoardOIDCUser(&user)
+	if err != nil {
+		if strings.Contains(err.Error(), dao.ErrDupUser.Error()) {
+			oc.RenderError(http.StatusConflict, "Conflict in username, the user with same username has been onboarded.")
+			return nil, false
+		}
+
+		oc.SendInternalServerError(err)
+		oc.DelSession(userInfoKey)
+		return nil, false
+	}
+
+	return &user, true
 }
 
 // Onboard handles the request to onboard a user authenticated via OIDC provider
@@ -181,46 +269,21 @@ func (oc *OIDCController) Onboard() {
 		oc.SendBadRequestError(errors.New("Failed to get OIDC token from session"))
 		return
 	}
-	s, t, err := secretAndToken(tb)
-	if err != nil {
-		oc.SendInternalServerError(err)
-		return
-	}
+
 	d := &oidcUserData{}
-	err = json.Unmarshal([]byte(userInfoStr), &d)
+	err := json.Unmarshal([]byte(userInfoStr), &d)
 	if err != nil {
 		oc.SendInternalServerError(err)
 		return
 	}
-	oidcUser := models.OIDCUser{
-		SubIss: d.Subject + d.Issuer,
-		Secret: s,
-		Token:  t,
-	}
 
-	email := d.Email
-	user := models.User{
-		Username:     username,
-		Realname:     d.Username,
-		Email:        email,
-		OIDCUserMeta: &oidcUser,
-		Comment:      oidcUserComment,
-	}
+	user, onboarded := userOnboard(oc, d, username, tb)
 
-	err = dao.OnBoardOIDCUser(&user)
-	if err != nil {
-		if strings.Contains(err.Error(), dao.ErrDupUser.Error()) {
-			oc.RenderError(http.StatusConflict, "Conflict in username, the user with same username has been onboarded.")
-			return
-		}
-		oc.SendInternalServerError(err)
+	if onboarded {
+		user.OIDCUserMeta = nil
 		oc.DelSession(userInfoKey)
-		return
+		oc.PopulateUserSession(*user)
 	}
-
-	user.OIDCUserMeta = nil
-	oc.DelSession(userInfoKey)
-	oc.PopulateUserSession(user)
 }
 
 func secretAndToken(tokenBytes []byte) (string, string, error) {
