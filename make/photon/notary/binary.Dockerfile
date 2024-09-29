@@ -1,4 +1,4 @@
-FROM golang:1.13.8
+FROM golang:latest
 
 ARG NOTARY_VERSION
 ARG MIGRATE_VERSION
